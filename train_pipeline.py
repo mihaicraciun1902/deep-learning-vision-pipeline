@@ -14,9 +14,13 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import f1_score
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+# Auto-detect GPU hardware. Fallback to CPU for local testing.
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class CustomVisionDataset(Dataset):
+    """
+    Standard PyTorch Dataset abstraction for loading images via CSV annotations.
+    """
     def __init__(self, csv_file, img_dir, transform=None):
         self.annotations = pd.read_csv(csv_file)
         self.img_dir = img_dir
@@ -27,6 +31,7 @@ class CustomVisionDataset(Dataset):
 
     def __getitem__(self, index):
         img_path = os.path.join(self.img_dir, self.annotations.iloc[index, 0])
+        # Convert to RGB explicitly to handle edge cases like grayscale images
         image = Image.open(img_path).convert("RGB")
         label = torch.tensor(int(self.annotations.iloc[index, 1]))
 
@@ -36,14 +41,20 @@ class CustomVisionDataset(Dataset):
         return image, label
 
 def get_transforms():
+    """
+    Defines the augmentation pipeline. Augmentations prevent the model from 
+    memorizing the exact pixel layout of the small training set.
+    """
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
+        # ImageNet standard normalization
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
+    # Validation strictly formats the image without randomizing it
     val_transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
@@ -53,9 +64,16 @@ def get_transforms():
     return train_transform, val_transform
 
 def create_balanced_sampler(dataset):
+    """
+    Builds a WeightedRandomSampler. 
+    Crucial for highly imbalanced datasets (like medical lesions) so the model 
+    doesn't just predict the majority class. Weights are inversely proportional to class frequency.
+    """
     labels = dataset.annotations.iloc[:, 1].values
     class_counts = pd.Series(labels).value_counts().sort_index().values
     class_weights = 1.0 / class_counts
+    
+    # Map weights back to individual samples
     sample_weights = [class_weights[label] for label in labels]
     
     return WeightedRandomSampler(
@@ -65,11 +83,16 @@ def create_balanced_sampler(dataset):
     )
 
 class CustomCNN(nn.Module):
+    """
+    Custom 4-layer Convolutional architecture.
+    """
     def __init__(self, num_classes):
         super(CustomCNN, self).__init__()
+        
+        # Feature extraction
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.BatchNorm2d(32), # Speeds up convergence by stabilizing gradients
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
             
@@ -78,8 +101,10 @@ class CustomCNN(nn.Module):
             nn.ReLU(),
             nn.MaxPool2d(2, 2)
         )
+        
+        # Classification head
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
+            nn.Dropout(0.5), # Regularization to prevent overfitting on the dense layers
             nn.Linear(64 * 56 * 56, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
@@ -93,17 +118,25 @@ class CustomCNN(nn.Module):
         return x
 
 def build_transfer_learning_model(num_classes, fine_tune=True):
+    """
+    Adapts a pre-trained ResNet18 backbone.
+    """
     model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     
+    # If not fine-tuning, freeze the backbone weights to act purely as a feature extractor
     if not fine_tune:
         for param in model.parameters():
             param.requires_grad = False
             
+    # Swap out the ImageNet 1000-class head for our specific num_classes
     num_ftrs = model.fc.in_features
     model.fc = nn.Linear(num_ftrs, num_classes)
     return model
 
 def train_model(model, dataloaders, criterion, optimizer, scheduler, num_epochs=25, experiment_name="run_1"):
+    """
+    Main training loop. Handles backprop, evaluation, TensorBoard logging, and checkpointing.
+    """
     writer = SummaryWriter(f'runs/{experiment_name}')
     best_model_wts = copy.deepcopy(model.state_dict())
     best_f1 = 0.0
@@ -125,6 +158,7 @@ def train_model(model, dataloaders, criterion, optimizer, scheduler, num_epochs=
                 inputs, labels = inputs.to(device), labels.to(device)
                 optimizer.zero_grad()
 
+                # Only track history if we are training
                 with torch.set_grad_enabled(phase == 'train'):
                     outputs = model(inputs)
                     _, preds = torch.max(outputs, 1)
@@ -138,17 +172,21 @@ def train_model(model, dataloaders, criterion, optimizer, scheduler, num_epochs=
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
+            # Step the LR scheduler based on epoch
             if phase == 'train' and scheduler is not None:
                 scheduler.step()
 
+            # Calculate metrics
             epoch_loss = running_loss / len(dataloaders[phase].dataset)
             epoch_f1 = f1_score(all_labels, all_preds, average='macro')
 
+            # Log to TensorBoard for visualization/ablation tracking
             writer.add_scalar(f'Loss/{phase}', epoch_loss, epoch)
             writer.add_scalar(f'F1_Macro/{phase}', epoch_f1, epoch)
 
             logging.info(f'{phase.capitalize()} Loss: {epoch_loss:.4f} | F1 Macro: {epoch_f1:.4f}')
 
+            # Cache the best weights based on validation F1
             if phase == 'val' and epoch_f1 > best_f1:
                 best_f1 = epoch_f1
                 best_model_wts = copy.deepcopy(model.state_dict())
@@ -169,10 +207,12 @@ if __name__ == "__main__":
     model = build_transfer_learning_model(num_classes=NUM_CLASSES, fine_tune=True).to(device)
     
     criterion = nn.CrossEntropyLoss()
+    # AdamW handles weight decay better than standard Adam
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     
+    # Advanced Scheduler: Warmup prevents early destabilization, Cosine Annealing smooths convergence
     warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=5)
     cosine = CosineAnnealingLR(optimizer, T_max=EPOCHS-5)
     scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[5])
 
-    logging.info("Pipeline ready. Local execution paths required for dataloaders.")
+    logging.info("Pipeline initialized. Ready for execution via dataloaders.")
